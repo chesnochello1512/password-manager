@@ -53,7 +53,7 @@ class Category:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "Category":
+    def from_dict(cls, raw: dict[str, Any]) -> Category:
         category_id = str(raw.get("id", "")).strip()
         name = str(raw.get("name", "")).strip()
         if not category_id or not name:
@@ -89,7 +89,7 @@ class AppSettings:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "AppSettings":
+    def from_dict(cls, raw: dict[str, Any] | None) -> AppSettings:
         settings = cls()
         if not isinstance(raw, dict):
             return settings
@@ -162,6 +162,16 @@ class PasswordRecord:
     updated_at: datetime
     format_version: int = config.VAULT_FORMAT_VERSION
     key_version: int = 1
+    _search_text: str = field(default="", init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._search_text = f"{self.title}\n{self.username}\n{self.url}".casefold()
+
+    @property
+    def search_text(self) -> str:
+        """Pre-folded text used by the in-memory search."""
+
+        return self._search_text
 
     @staticmethod
     def new_id() -> str:
@@ -187,7 +197,7 @@ class PasswordRecord:
         updated_at: datetime,
         format_version: int,
         key_version: int,
-    ) -> "PasswordRecord":
+    ) -> PasswordRecord:
         if not isinstance(payload, dict):
             raise ValidationError("Повреждена запись хранилища.")
 

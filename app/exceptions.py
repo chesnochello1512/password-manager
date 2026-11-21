@@ -33,6 +33,17 @@ class VaultCorruptedError(VaultError):
     """The vault is structurally damaged or has an unsupported format."""
 
 
+class VaultReopenError(VaultError):
+    """The vault file was replaced but could not be opened again.
+
+    The operation has already been committed: the new master password is the
+    one that now protects the file on disk.  The UI must not claim that the
+    data is unchanged.
+    """
+
+    committed = True
+
+
 class DecryptionError(VaultError):
     """Authenticated decryption failed."""
 

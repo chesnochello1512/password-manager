@@ -9,11 +9,11 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
 
 from app import config
 from app.exceptions import StorageError, VaultCorruptedError
@@ -160,10 +160,20 @@ class Database:
         try:
             yield connection
         except Exception:
-            connection.execute("ROLLBACK")
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
         else:
-            connection.execute("COMMIT")
+            try:
+                connection.execute("COMMIT")
+            except sqlite3.Error as exc:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise StorageError("Не удалось зафиксировать изменения в базе данных.") from exc
 
     # ------------------------------------------------------------------ meta
     def get_meta(self, key: str) -> str | None:
@@ -271,9 +281,14 @@ class Database:
         if cursor.rowcount == 0:
             raise StorageError("Запись не найдена.")
 
-    def delete_record(self, record_id: str) -> None:
+    def delete_record(
+        self,
+        record_id: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        target = connection or self.connection
         try:
-            self.connection.execute("DELETE FROM records WHERE id = ?", (record_id,))
+            target.execute("DELETE FROM records WHERE id = ?", (record_id,))
         except sqlite3.Error as exc:
             raise StorageError("Не удалось удалить запись.") from exc
 
@@ -304,9 +319,16 @@ class Database:
             updated_at=str(row["updated_at"]),
         )
 
-    def set_settings_raw(self, nonce: bytes, ciphertext: bytes, updated_at: str) -> None:
+    def set_settings_raw(
+        self,
+        nonce: bytes,
+        ciphertext: bytes,
+        updated_at: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        target = connection or self.connection
         try:
-            self.connection.execute(
+            target.execute(
                 "INSERT INTO vault_settings(id, nonce, ciphertext, updated_at) VALUES(1, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET nonce = excluded.nonce, "
                 "ciphertext = excluded.ciphertext, updated_at = excluded.updated_at",
@@ -430,7 +452,10 @@ class Database:
             if settings_row is None:
                 info.message = "В хранилище отсутствуют зашифрованные настройки."
                 return info
-            if int(settings_row["nonce_len"] or 0) != config.NONCE_SIZE or int(settings_row["ct_len"] or 0) < config.AUTH_TAG_SIZE:
+            if (
+                int(settings_row["nonce_len"] or 0) != config.NONCE_SIZE
+                or int(settings_row["ct_len"] or 0) < config.AUTH_TAG_SIZE
+            ):
                 info.message = "Настройки хранилища повреждены."
                 return info
 

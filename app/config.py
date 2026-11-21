@@ -8,7 +8,7 @@ from pathlib import Path
 
 APP_NAME = "Password Manager"
 APP_SLUG = "PasswordManager"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 VAULT_FILENAME = "vault.db"
 VAULT_FORMAT_VERSION = 1

@@ -51,7 +51,7 @@ def test_passwords_are_not_repeated() -> None:
 def test_strength_grows_with_length() -> None:
     short = estimate_strength("Ab3!")
     medium = estimate_strength("Ab3!xY7@kL9#")
-    strong = estimate_strength(generate_password(GeneratorOptions(length=32)))
+    strong = estimate_strength(generate_password(GeneratorOptions(length=32)), generated=True)
     assert short.score <= medium.score < strong.score
     assert strong.entropy_bits > 90
     assert 0 <= short.percent <= 100
@@ -61,3 +61,37 @@ def test_empty_password_strength() -> None:
     result = estimate_strength("")
     assert result.score == 0
     assert result.entropy_bits == 0
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "aaaaaaaaaaaaaaaaaaaa",
+        "password123",
+        "qwerty123",
+        "12345678",
+        "abcabcabc",
+        "qweasdzxc",
+        "01012000",
+    ],
+)
+def test_obvious_manual_passwords_are_not_strong(password: str) -> None:
+    result = estimate_strength(password)
+    assert result.score <= 1
+    assert result.entropy_bits < 50
+    assert result.warning
+
+
+def test_manual_password_does_not_show_generator_bits() -> None:
+    result = estimate_strength("a" * 20)
+    assert result.generated is False
+    assert result.warning
+
+
+def test_generated_password_keeps_generator_model() -> None:
+    password = generate_password(GeneratorOptions(length=32))
+    result = estimate_strength(password, generated=True)
+    assert result.generated is True
+    assert result.score == 4
+    assert result.entropy_bits > 90
+    assert result.warning == ""

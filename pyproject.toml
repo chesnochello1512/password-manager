@@ -1,0 +1,28 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: long-running performance or production-KDF checks",
+    "integration: checks that depend on the real environment",
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "app/services",
+    "app/security",
+    "app/database",
+    "app/models.py",
+    "app/config.py",
+    "app/exceptions.py",
+]
+ignore_missing_imports = true
+warn_unused_ignores = true

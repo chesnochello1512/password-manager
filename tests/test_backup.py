@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from app.database.database import Database
-from app.exceptions import BackupError
+from app.exceptions import BackupError, InvalidMasterPasswordError
 from app.security.key_manager import KeyManager
 from app.services.backup_service import BackupService
 from app.services.password_service import PasswordService
@@ -108,11 +108,26 @@ def test_restore_keeps_backup_password(vault, tmp_path) -> None:
     database = Database(target)
     database.connect()
     keys = KeyManager(database)
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidMasterPasswordError):
         keys.unlock(vault.password)
     keys.unlock("Backup-Master-Password-77!")
     assert keys.unlocked
     keys.close()
+
+
+def test_cryptographic_verification_rejects_another_vault(vault, tmp_path) -> None:
+    other_path = tmp_path / "other-vault.db"
+    other_db = Database(other_path)
+    other_keys = KeyManager(other_db)
+    other_keys.create_vault("Other-Master-Password!77")
+    other_keys.close()
+
+    info = BackupService.validate_backup(other_path)
+    assert info.valid is True
+    assert info.vault_id != vault.keys.vault_id
+
+    with pytest.raises(BackupError):
+        BackupService.verify_cryptographic(other_path, vault.keys)
 
 
 def test_cryptographic_verification_detects_tampering(vault, tmp_path) -> None:

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.exceptions import ValidationError
+from app.database.database import Database
+from app.exceptions import StorageError, ValidationError, VaultLockedError
 from app.services.generator import GeneratorOptions, generate_password
 from app.services.password_service import PasswordService
 
@@ -73,7 +74,106 @@ def test_added_records_are_immediately_searchable(vault) -> None:
 
 def test_service_requires_unlocked_state(vault) -> None:
     vault.keys.lock()
-    with pytest.raises(Exception):
+    with pytest.raises(VaultLockedError):
         vault.service.list_records()
-    with pytest.raises(Exception):
+    with pytest.raises(VaultLockedError):
         PasswordService(vault.db, vault.keys).load()
+
+
+def test_stats_counts_in_one_call(vault) -> None:
+    service = vault.service
+    service.create_record(title="One", password="x", category_id="work", favorite=True)
+    service.create_record(title="Two", password="x", category_id="work")
+    service.create_record(title="Three", password="x", category_id="social")
+
+    total, favorites, counts = service.stats()
+    assert total == 3
+    assert favorites == 1
+    assert counts["work"] == 2
+    assert counts["social"] == 1
+
+
+def test_delete_category_is_atomic_on_midway_failure(vault, monkeypatch) -> None:
+    service = vault.service
+    for index in range(4):
+        service.create_record(title=f"Work {index}", password="x", category_id="work")
+
+    original = Database.update_record_raw
+    calls = {"count": 0}
+
+    def flaky(self, record, connection=None):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise StorageError("simulated failure")
+        return original(self, record, connection)
+
+    monkeypatch.setattr(Database, "update_record_raw", flaky)
+
+    with pytest.raises(StorageError):
+        service.delete_category("work")
+
+    assert service.settings.category("work") is not None
+    assert all(record.category_id == "work" for record in service.list_records())
+
+    service.load()
+    assert service.settings.category("work") is not None
+    assert all(record.category_id == "work" for record in service.list_records())
+
+
+def test_delete_category_rolls_back_when_settings_write_fails(vault, monkeypatch) -> None:
+    service = vault.service
+    service.create_record(title="Work", password="x", category_id="work")
+
+    original = Database.set_settings_raw
+
+    def failing(self, nonce, ciphertext, updated_at, connection=None):
+        raise StorageError("settings failure")
+
+    monkeypatch.setattr(Database, "set_settings_raw", failing)
+
+    with pytest.raises(StorageError):
+        service.delete_category("work")
+
+    assert service.settings.category("work") is not None
+    assert service.list_records()[0].category_id == "work"
+
+    service.load()
+    assert service.settings.category("work") is not None
+    assert service.list_records()[0].category_id == "work"
+    assert original is not None
+
+
+def test_add_category_does_not_mutate_memory_before_commit(vault, monkeypatch) -> None:
+    service = vault.service
+    original_names = [category.name for category in service.settings.categories]
+
+    def failing(self, nonce, ciphertext, updated_at, connection=None):
+        raise StorageError("settings failure")
+
+    monkeypatch.setattr(Database, "set_settings_raw", failing)
+
+    with pytest.raises(StorageError):
+        service.add_category("Should Not Exist")
+
+    assert [category.name for category in service.settings.categories] == original_names
+    service.load()
+    assert [category.name for category in service.settings.categories] == original_names
+
+
+def test_auto_lock_change_rolls_back_on_write_failure(vault, monkeypatch) -> None:
+    service = vault.service
+    before = service.settings.auto_lock_minutes
+    candidate = service.settings
+    candidate.auto_lock_minutes = 10 if before != 10 else 15
+
+    def failing(self, nonce, ciphertext, updated_at, connection=None):
+        raise StorageError("settings failure")
+
+    monkeypatch.setattr(Database, "set_settings_raw", failing)
+
+    with pytest.raises(StorageError):
+        service.save_settings(candidate)
+
+    assert service.settings.auto_lock_minutes == before
+    service.load()
+    assert service.settings.auto_lock_minutes == before

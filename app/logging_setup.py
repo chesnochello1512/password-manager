@@ -17,7 +17,7 @@ def setup_logging() -> Path:
     root.setLevel(logging.INFO)
 
     for handler in list(root.handlers):
-        if isinstance(handler, (RotatingFileHandler, logging.StreamHandler)):
+        if isinstance(handler, RotatingFileHandler | logging.StreamHandler):
             root.removeHandler(handler)
 
     formatter = logging.Formatter(

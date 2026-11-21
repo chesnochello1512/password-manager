@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
@@ -24,12 +25,13 @@ from app.exceptions import (
     BackupError,
     InvalidMasterPasswordError,
     PasswordManagerError,
+    VaultReopenError,
 )
+from app.security.key_manager import KeyManager
 from app.services.backup_service import BackupService
 from app.services.clipboard_service import ClipboardService
 from app.services.generator import estimate_strength
 from app.services.password_service import PasswordService
-from app.security.key_manager import KeyManager
 from app.ui.async_utils import TaskRunner
 from app.ui.styles import SUCCESS, TEXT_MUTED
 from app.ui.widgets import (
@@ -47,13 +49,27 @@ logger = logging.getLogger(__name__)
 
 
 class ChangePasswordDialog(BaseDialog):
-    def __init__(self, key_manager: KeyManager, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        key_manager: KeyManager,
+        parent: QWidget | None = None,
+        runner: TaskRunner | None = None,
+    ) -> None:
         super().__init__(parent, "Смена мастер-пароля", width=520, icon_name="lock")
         self._keys = key_manager
-        self._runner = TaskRunner(self)
+        self._runner = runner or TaskRunner(self)
+        self._lock_requested = False
         self._runner.succeeded.connect(self._on_success)
         self._runner.failed.connect(self._on_failure)
         self._build()
+
+    @property
+    def is_busy(self) -> bool:
+        return self._runner.busy
+
+    @property
+    def lock_requested(self) -> bool:
+        return self._lock_requested
 
     def _build(self) -> None:
         self.body.addWidget(
@@ -97,9 +113,9 @@ class ChangePasswordDialog(BaseDialog):
         self.body.addWidget(self.progress)
 
         self.footer.addStretch(1)
-        cancel = make_button("Отмена", "Ghost")
-        cancel.clicked.connect(self.reject)
-        self.footer.addWidget(cancel)
+        self.cancel_button = make_button("Отмена", "Ghost")
+        self.cancel_button.clicked.connect(self.reject)
+        self.footer.addWidget(self.cancel_button)
         self.save_button = PrimaryButton("Изменить пароль", "lock")
         self.save_button.clicked.connect(self._submit)
         self.footer.addWidget(self.save_button)
@@ -134,18 +150,48 @@ class ChangePasswordDialog(BaseDialog):
 
     def _on_success(self, _result: object) -> None:
         self._set_busy(False)
+        if self._lock_requested:
+            self.reject()
+            return
         self.accept()
 
     def _on_failure(self, error: object) -> None:
         self._set_busy(False)
+        if self._lock_requested:
+            self.reject()
+            return
         if isinstance(error, InvalidMasterPasswordError):
             message = "Неверный текущий мастер-пароль."
+        elif isinstance(error, VaultReopenError):
+            message = str(error)
         elif isinstance(error, PasswordManagerError):
             message = str(error)
         else:
             logger.error("Master password change failed: %s", type(error).__name__)
             message = "Не удалось изменить мастер-пароль. Данные не изменены."
         self._show_error(message)
+
+    def prepare_for_lock(self) -> None:
+        """Hide and wipe secrets while a background rekey is still running."""
+
+        self._lock_requested = True
+        self.current_input.clear()
+        self.new_input.clear()
+        self.confirm_input.clear()
+        self.error.clear()
+        self.strength.clear()
+        self.hide()
+
+    def reject(self) -> None:
+        if self._runner.busy:
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._runner.busy:
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _show_error(self, message: str) -> None:
         self.error.setText(message)
@@ -157,6 +203,8 @@ class ChangePasswordDialog(BaseDialog):
             field.setEnabled(not busy)
         self.save_button.setEnabled(not busy)
         self.save_button.setText("Перешифровка…" if busy else "Изменить пароль")
+        self.cancel_button.setEnabled(not busy)
+        self.close_button.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.adjustSize()
 
@@ -165,6 +213,7 @@ class ChangePasswordDialog(BaseDialog):
         self.new_input.clear()
         self.confirm_input.clear()
         self.error.clear()
+        self.strength.clear()
         super().done(result)
 
 
@@ -182,6 +231,7 @@ class SettingsPage(QWidget):
         clipboard: ClipboardService,
         vault_path: Path,
         parent: QWidget | None = None,
+        runner: TaskRunner | None = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
@@ -189,6 +239,7 @@ class SettingsPage(QWidget):
         self._keys = key_manager
         self._clipboard = clipboard
         self._vault_path = vault_path
+        self._runner = runner
         self._build()
 
     # ------------------------------------------------------------------ layout
@@ -385,13 +436,12 @@ class SettingsPage(QWidget):
     # ------------------------------------------------------------------ actions
     def _on_auto_lock_changed(self) -> None:
         value = int(self.auto_lock_combo.currentData())
-        candidate = self._service.settings
-        old = candidate.auto_lock_minutes
+        old = self._service.settings.auto_lock_minutes
+        candidate = copy.deepcopy(self._service.settings)
         candidate.auto_lock_minutes = value
         try:
             self._service.save_settings(candidate)
         except PasswordManagerError as exc:
-            candidate.auto_lock_minutes = old
             self._select_combo(self.auto_lock_combo, old)
             MessageDialog.show_error(self, "Не удалось сохранить настройку", str(exc))
             return
@@ -399,20 +449,19 @@ class SettingsPage(QWidget):
 
     def _on_clipboard_changed(self) -> None:
         value = int(self.clipboard_combo.currentData())
-        candidate = self._service.settings
-        old = candidate.clipboard_clear_seconds
+        old = self._service.settings.clipboard_clear_seconds
+        candidate = copy.deepcopy(self._service.settings)
         candidate.clipboard_clear_seconds = value
         try:
             self._service.save_settings(candidate)
         except PasswordManagerError as exc:
-            candidate.clipboard_clear_seconds = old
             self._select_combo(self.clipboard_combo, old)
             MessageDialog.show_error(self, "Не удалось сохранить настройку", str(exc))
             return
         self._clipboard.set_clear_after(value)
 
     def _change_password(self) -> None:
-        dialog = ChangePasswordDialog(self._keys, self)
+        dialog = ChangePasswordDialog(self._keys, self, runner=self._runner)
         if dialog.exec() == ChangePasswordDialog.DialogCode.Accepted:
             MessageDialog.show_success(
                 self,

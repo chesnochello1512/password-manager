@@ -18,14 +18,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
 from app import config
 from app.models import PasswordRecord, display_timestamp
+from app.security.key_manager import KeyManager
 from app.services.backup_service import BackupService
 from app.services.clipboard_service import ClipboardService
 from app.services.password_service import PasswordService
 from app.services.session_service import AutoLockService
-from app.security.key_manager import KeyManager
 from app.ui import icons
+from app.ui.async_utils import TaskRunner
 from app.ui.category_dialog import CategoryDialog
 from app.ui.generator_dialog import GeneratorDialog
 from app.ui.password_dialog import PasswordDialog
@@ -77,6 +79,7 @@ class MainWindow(QWidget):
         service: PasswordService,
         backup_service: BackupService,
         clipboard: ClipboardService,
+        runner: TaskRunner | None = None,
     ) -> None:
         super().__init__(None)
         self._vault_path = vault_path
@@ -84,6 +87,7 @@ class MainWindow(QWidget):
         self._service = service
         self._backups = backup_service
         self._clipboard = clipboard
+        self._runner = runner
         self._selected_id: str | None = None
         self._current_record: PasswordRecord | None = None
         self._filter = "all"
@@ -153,6 +157,7 @@ class MainWindow(QWidget):
             self._keys,
             self._clipboard,
             self._vault_path,
+            runner=self._runner,
         )
         self.settings_page.auto_lock_changed.connect(self._on_auto_lock_changed)
         self.settings_page.lock_requested.connect(self.lock_requested.emit)
@@ -427,12 +432,13 @@ class MainWindow(QWidget):
         categories = sorted(
             self._service.settings.categories, key=lambda item: (item.order, item.name.casefold())
         )
+        _, _, counts = self._service.stats()
         for category in categories:
             item = SidebarItem(
                 category.id,
                 category.name,
                 icons.category_icon_id(category.id),
-                self._service.count_by_category(category.id),
+                counts.get(category.id, 0),
             )
             item.clicked.connect(self._on_sidebar_clicked)
             self._categories_layout.addWidget(item)
@@ -451,10 +457,11 @@ class MainWindow(QWidget):
                 self._filter == category_id and not self._settings_open
             )
         self._settings_item.set_selected(self._settings_open)
-        self._all_item.set_count(self._service.count_all())
-        self._favorites_item.set_count(self._service.count_favorites())
+        total, favorites, counts = self._service.stats()
+        self._all_item.set_count(total)
+        self._favorites_item.set_count(favorites)
         for category_id, item in self._category_items.items():
-            item.set_count(self._service.count_by_category(category_id))
+            item.set_count(counts.get(category_id, 0))
 
     def _focus_search(self) -> None:
         self._show_vault_page()
@@ -799,9 +806,7 @@ class MainWindow(QWidget):
             show_toast(self, "Автоблокировка отключена", "warning")
 
     def _on_auto_lock_timeout(self) -> None:
-        for widget in QApplication.topLevelWidgets():
-            if isinstance(widget, QDialog) and widget.isVisible():
-                widget.reject()
+        self._prepare_dialogs_for_lock()
         self._hide_password()
         self._autolock.stop()
         QTimer.singleShot(0, self.lock_requested.emit)
@@ -823,9 +828,7 @@ class MainWindow(QWidget):
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
-        for widget in QApplication.topLevelWidgets():
-            if isinstance(widget, QDialog) and widget.isVisible():
-                widget.reject()
+        self._prepare_dialogs_for_lock()
         self._selected_id = None
         self._current_record = None
         self._hide_password()
@@ -838,6 +841,25 @@ class MainWindow(QWidget):
             self.created_label.clear()
             self.updated_label.clear()
         self.detail_stack.setCurrentIndex(0)
+
+    def _prepare_dialogs_for_lock(self) -> None:
+        """Close dialogs, but let a busy rekey dialog wipe its secrets instead.
+
+        A rekey worker owns the vault connection until it finishes.  Destroying
+        its dialog (and therefore its QObject parent chain) mid-operation was the
+        root cause of SEC-01, so the dialog stays alive until the runner reports
+        the result and rejects itself.
+        """
+
+        for widget in QApplication.topLevelWidgets():
+            if not isinstance(widget, QDialog) or not widget.isVisible():
+                continue
+            prepare = getattr(widget, "prepare_for_lock", None)
+            is_busy = getattr(widget, "is_busy", False)
+            if callable(prepare) and is_busy:
+                prepare()
+            else:
+                widget.reject()
 
     def force_close(self) -> None:
         self._allow_close = True

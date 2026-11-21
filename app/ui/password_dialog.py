@@ -157,9 +157,9 @@ class PasswordDialog(BaseDialog):
                 self.category_combo.setCurrentIndex(index)
         self.category_combo.blockSignals(False)
 
-    def _update_strength(self, text: str) -> None:
+    def _update_strength(self, text: str, generated: bool = False) -> None:
         if text:
-            self.strength.set_result(estimate_strength(text))
+            self.strength.set_result(estimate_strength(text, generated=generated))
         else:
             self.strength.clear()
 
@@ -173,7 +173,7 @@ class PasswordDialog(BaseDialog):
         if password:
             self.password_input.setText(password)
             self.password_input.show_password(12)
-            self._update_strength(password)
+            self._update_strength(password, generated=True)
 
     def _add_category(self) -> None:
         name = TextInputDialog.get_text(

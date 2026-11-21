@@ -413,7 +413,16 @@ class StrengthMeter(QWidget):
 
     def set_result(self, result: StrengthResult) -> None:
         self.bars.set_score(result.score)
-        self.caption.setText(f"Надёжность: {result.label} · ≈{result.entropy_bits:.0f} бит")
+        if result.generated:
+            caption = (
+                f"Надёжность: {result.label} · ≈{result.entropy_bits:.0f} бит "
+                "(оценка генератора)"
+            )
+        else:
+            caption = f"Надёжность: {result.label}"
+            if result.warning:
+                caption += f" · {result.warning}"
+        self.caption.setText(caption)
 
     def clear(self) -> None:
         self.bars.reset()
@@ -529,6 +538,7 @@ class BaseDialog(QDialog):
         close_button = IconButton("x", "Закрыть", 30, 16)
         close_button.clicked.connect(self.reject)
         header_layout.addWidget(close_button)
+        self.close_button = close_button
         inner.addWidget(header)
 
         body_widget = QWidget()
@@ -750,7 +760,7 @@ def show_toast(parent: QWidget | None, text: str, kind: str = "info", duration: 
         except RuntimeError:
             pass
     toast = Toast(target, text, kind, duration)
-    setattr(target, "_active_toast", toast)
+    setattr(target, "_active_toast", toast)  # noqa: B010 - Qt object has no declared attribute
     toast.start()
 
 

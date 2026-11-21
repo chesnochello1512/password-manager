@@ -18,6 +18,7 @@ from app.exceptions import (
     VaultExistsError,
     VaultLockedError,
     VaultNotFoundError,
+    VaultReopenError,
 )
 from app.models import AppSettings, default_categories
 from app.security import encryption
@@ -65,7 +66,8 @@ class KeyManager:
 
     @property
     def key_version(self) -> int:
-        self.key
+        if not self.unlocked:
+            raise VaultLockedError("Хранилище заблокировано.")
         try:
             return max(1, int(self._db.get_meta("key_version") or "1"))
         except (ValueError, StorageError):
@@ -219,6 +221,9 @@ class KeyManager:
     def change_master_password(self, current_password: str, new_password: str) -> None:
         if not self.unlocked:
             raise VaultLockedError("Хранилище заблокировано.")
+        vault_key = self._key
+        if vault_key is None:
+            raise VaultLockedError("Хранилище заблокировано.")
         if not current_password:
             raise ValidationError("Введите текущий мастер-пароль.")
         self._validate_master_password(new_password)
@@ -246,11 +251,16 @@ class KeyManager:
         vault_id = meta["vault_id"]
         new_salt = encryption.random_bytes(config.SALT_SIZE)
         new_params = encryption.default_kdf_params()
-        new_key = encryption.derive_key(new_password.encode("utf-8"), new_salt, new_params)
+        new_key: bytearray | None = encryption.derive_key(
+            new_password.encode("utf-8"), new_salt, new_params
+        )
+        assert new_key is not None
         target = self._db.path
 
         temp_path = target.parent / f".{target.name}.rekey-{uuid.uuid4().hex}"
         temp_db = Database(temp_path)
+        committed = False
+        old_key: bytearray | None = None
         try:
             temp_db.connect()
             temp_db.ensure_schema()
@@ -263,7 +273,7 @@ class KeyManager:
             records: list[RawRecord] = []
             for raw in self._db.iter_records_raw():
                 plaintext = encryption.decrypt_bytes(
-                    self._key,
+                    vault_key,
                     raw.nonce,
                     raw.ciphertext,
                     encryption.build_aad(vault_id, "record", raw.id, raw.format_version),
@@ -289,7 +299,7 @@ class KeyManager:
             if settings_raw is None:
                 raise VaultCorruptedError("В хранилище отсутствуют зашифрованные настройки.")
             settings_plaintext = encryption.decrypt_bytes(
-                self._key,
+                vault_key,
                 settings_raw.nonce,
                 settings_raw.ciphertext,
                 encryption.build_aad(vault_id, "settings"),
@@ -324,26 +334,42 @@ class KeyManager:
             if not info.valid:
                 raise VaultCorruptedError(f"Проверка нового хранилища не пройдена: {info.message}")
 
-            old_key = self._key
+            # Commit point.  Before os.replace() the old vault is untouched;
+            # after it the new password is authoritative even if reopening the
+            # connection fails.
+            old_key = vault_key
             self._db.close()
             os.replace(temp_path, target)
+            committed = True
             self._key = new_key
             self._vault_id = vault_id
             new_key = None
-            self._db.connect()
             if old_key is not None:
                 encryption.zeroize(old_key)
-        except Exception:
+                old_key = None
+            try:
+                self._db.connect()
+            except Exception as exc:
+                raise VaultReopenError(
+                    "Мастер-пароль изменён, но хранилище не удалось открыть заново. "
+                    "Войдите с новым мастер-паролем."
+                ) from exc
+        except Exception as exc:
             temp_db.close()
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-            if not self._db.is_open:
+            if not committed and not self._db.is_open:
                 try:
                     self._db.connect()
                 except Exception:
                     pass
+            if committed and not isinstance(exc, VaultReopenError):
+                raise VaultReopenError(
+                    "Мастер-пароль изменён, но хранилище не удалось открыть заново. "
+                    "Войдите с новым мастер-паролем."
+                ) from exc
             raise
         finally:
             if new_key is not None:

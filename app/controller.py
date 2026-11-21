@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QObject
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, Qt
+from PySide6.QtWidgets import QApplication, QProgressDialog
 
 from app import config
 from app.database.database import Database
-from app.exceptions import PasswordManagerError, VaultError
+from app.exceptions import PasswordManagerError, VaultError, VaultReopenError
 from app.security.key_manager import KeyManager
 from app.services.backup_service import BackupService
 from app.services.clipboard_service import ClipboardService
 from app.services.password_service import PasswordService
+from app.ui.async_utils import TaskRunner
 from app.ui.login_window import LoginWindow
 from app.ui.main_window import MainWindow
 from app.ui.widgets import MessageDialog, show_toast
@@ -30,6 +31,13 @@ class ApplicationController(QObject):
         self._login: LoginWindow | None = None
         self._main: MainWindow | None = None
         self._shutting_down = False
+        self._runner = TaskRunner(self)
+        self._runner.failed.connect(self._on_operation_failed)
+        self._runner.finished.connect(self._on_operation_finished)
+        self._pending_lock = False
+        self._pending_quit = False
+        self._pending_notice = ""
+        self._operation_dialog: QProgressDialog | None = None
         self._build_services()
         app.aboutToQuit.connect(self._shutdown)
 
@@ -111,9 +119,10 @@ class ApplicationController(QObject):
             self._service,
             self._backups,
             self._clipboard,
+            runner=self._runner,
         )
         main.lock_requested.connect(self.lock)
-        main.close_requested.connect(self._app.quit)
+        main.close_requested.connect(self._request_quit)
         main.restore_requested.connect(self._restore_backup)
         self._main = main
         main.show()
@@ -132,11 +141,84 @@ class ApplicationController(QObject):
     def lock(self) -> None:
         if not self._keys.unlocked:
             return
+        if self._runner.busy:
+            self._pending_lock = True
+            self._prepare_for_pending_operation("Блокировка после завершения операции…")
+            return
+        self._do_lock()
+
+    def _do_lock(self, notice: str = "") -> None:
+        self._pending_lock = False
+        self._pending_notice = ""
+        self._hide_operation_dialog()
         self._dispose_main()
         self._service.clear()
         self._keys.lock()
         self._clipboard.clear_if_ours()
-        self._show_login(setup=False)
+        self._show_login(setup=False, notice=notice)
+
+    def _request_quit(self) -> None:
+        if self._runner.busy:
+            self._pending_quit = True
+            self._prepare_for_pending_operation("Завершение операции…")
+            return
+        self._hide_operation_dialog()
+        self._app.quit()
+
+    def _prepare_for_pending_operation(self, message: str) -> None:
+        """Wipe the UI immediately while the worker keeps the vault open."""
+
+        main = self._main
+        if main is not None:
+            try:
+                main.prepare_lock()
+                main.hide()
+            except RuntimeError:
+                pass
+        self._show_operation_dialog(message)
+
+    def _on_operation_failed(self, error: object) -> None:
+        if isinstance(error, VaultReopenError):
+            # The new password is already active on disk.  Do not leave the
+            # user on the vault screen with a closed database.
+            self._pending_lock = True
+            self._pending_notice = str(error)
+            self._prepare_for_pending_operation("Завершение операции…")
+
+    def _on_operation_finished(self) -> None:
+        if self._pending_quit:
+            self._pending_quit = False
+            self._pending_lock = False
+            self._hide_operation_dialog()
+            self._app.quit()
+            return
+        if self._pending_lock:
+            self._do_lock(notice=self._pending_notice)
+
+    def _show_operation_dialog(self, message: str) -> None:
+        if self._operation_dialog is None:
+            dialog = QProgressDialog(message, "", 0, 0, None)
+            dialog.setWindowTitle(config.APP_NAME)
+            dialog.setCancelButton(None)  # type: ignore[arg-type]
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setFixedWidth(380)
+            self._operation_dialog = dialog
+        else:
+            self._operation_dialog.setLabelText(message)
+        self._operation_dialog.show()
+        self._operation_dialog.raise_()
+
+    def _hide_operation_dialog(self) -> None:
+        dialog = self._operation_dialog
+        self._operation_dialog = None
+        if dialog is None:
+            return
+        dialog.close()
+        dialog.deleteLater()
 
     def _dispose_main(self) -> None:
         main = self._main
@@ -152,6 +234,13 @@ class ApplicationController(QObject):
 
     # ------------------------------------------------------------------ restore
     def _restore_backup(self, backup_path: str) -> None:
+        if self._runner.busy:
+            MessageDialog.show_error(
+                None,
+                "Операция уже выполняется",
+                "Дождитесь завершения смены мастер-пароля и повторите восстановление.",
+            )
+            return
         self._dispose_main()
         self._service.clear()
         self._keys.close()
@@ -180,6 +269,19 @@ class ApplicationController(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        self._hide_operation_dialog()
+        # Never close the database or wipe the key while a rekey worker is
+        # still reading or replacing the vault.
+        try:
+            self._runner.shutdown()
+        except Exception:
+            logger.exception("Failed to wait for background operation on shutdown")
+        login = self._login
+        if login is not None:
+            try:
+                login.shutdown()
+            except Exception:
+                logger.exception("Failed to wait for login worker on shutdown")
         try:
             self._clipboard.clear_if_ours()
         except Exception:

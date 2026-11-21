@@ -206,6 +206,11 @@ class LoginWindow(QWidget):
         self._allow_close_signal = False
         self.close()
 
+    def shutdown(self) -> None:
+        """Wait for a pending create/unlock worker before the app tears down."""
+
+        self._runner.shutdown()
+
     def _on_password_changed(self, text: str) -> None:
         if self._setup_mode:
             self.strength.setVisible(bool(text))
@@ -252,7 +257,7 @@ class LoginWindow(QWidget):
         self._set_busy(False)
         if isinstance(error, InvalidMasterPasswordError):
             message = "Неверный мастер-пароль. Попробуйте ещё раз."
-        elif isinstance(error, (VaultCorruptedError, VaultError, PasswordManagerError)):
+        elif isinstance(error, VaultCorruptedError | VaultError | PasswordManagerError):
             message = str(error)
         else:
             logger.error("Unlock failed: %s", type(error).__name__)

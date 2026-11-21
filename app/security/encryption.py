@@ -9,8 +9,8 @@ from __future__ import annotations
 import ctypes
 import hmac
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.exceptions import InvalidTag
@@ -47,7 +47,7 @@ class KdfParams:
         }
 
     @classmethod
-    def from_meta(cls, meta: Mapping[str, str]) -> "KdfParams":
+    def from_meta(cls, meta: Mapping[str, str]) -> KdfParams:
         if meta.get("kdf_algorithm") != "argon2id":
             raise ValidationError("Неподдерживаемый алгоритм получения ключа.")
         try:
@@ -79,7 +79,7 @@ def random_bytes(length: int) -> bytes:
 def derive_key(password: bytes, salt: bytes, params: KdfParams) -> bytearray:
     """Derive a 256-bit key from the master password using Argon2id."""
 
-    if not isinstance(password, (bytes, bytearray)):
+    if not isinstance(password, bytes | bytearray):
         raise TypeError("Master password must be bytes.")
     if len(salt) < 8:
         raise ValidationError("Соль ключа слишком короткая.")

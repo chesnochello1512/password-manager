@@ -186,7 +186,7 @@ class GeneratorDialog(BaseDialog):
         self._last_password = password
         self.preview.setText(password)
         self.preview.setCursorPosition(0)
-        self.strength.set_result(estimate_strength(password))
+        self.strength.set_result(estimate_strength(password, generated=True))
         self.adjustSize()
 
     def _copy(self) -> None:

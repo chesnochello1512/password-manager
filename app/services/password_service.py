@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 from app import config
@@ -30,6 +33,16 @@ from app.security.key_manager import KeyManager
 logger = logging.getLogger(__name__)
 
 
+class _ValidatedFields(TypedDict):
+    title: str
+    username: str
+    password: str
+    url: str
+    category_id: str
+    notes: str
+    favorite: bool
+
+
 class PasswordService:
     """Decrypts the vault into memory and provides CRUD/search operations."""
 
@@ -51,7 +64,9 @@ class PasswordService:
     def settings(self) -> AppSettings:
         if self._settings is None:
             raise VaultLockedError("Хранилище заблокировано.")
-        return self._settings
+        # Callers may edit a snapshot before saving it; return a copy so a
+        # failed write can never leave the in-memory state half-updated.
+        return copy.deepcopy(self._settings)
 
     def load(self) -> None:
         if not self._keys.unlocked:
@@ -138,8 +153,7 @@ class PasswordService:
             if category_id and record.category_id != category_id:
                 continue
             if needle:
-                haystack = f"{record.title}\n{record.username}\n{record.url}".casefold()
-                if needle not in haystack:
+                if needle not in record.search_text:
                     continue
             result.append(record)
         result.sort(key=lambda item: (not item.favorite, item.title.casefold(), item.username.casefold()))
@@ -163,6 +177,18 @@ class PasswordService:
     def count_by_category(self, category_id: str) -> int:
         self._require_loaded()
         return sum(1 for record in self._records.values() if record.category_id == category_id)
+
+    def stats(self) -> tuple[int, int, dict[str, int]]:
+        """Return total, favorites and per-category counts in one pass."""
+
+        self._require_loaded()
+        counts: dict[str, int] = {}
+        favorites = 0
+        for record in self._records.values():
+            counts[record.category_id] = counts.get(record.category_id, 0) + 1
+            if record.favorite:
+                favorites += 1
+        return len(self._records), favorites, counts
 
     # ------------------------------------------------------------------ mutations
     def create_record(
@@ -194,6 +220,13 @@ class PasswordService:
     def update_record(self, record_id: str, **fields: str | bool) -> PasswordRecord:
         self._require_loaded()
         existing = self.get_record(record_id)
+        updated = self._build_updated_record(existing, **fields)
+        raw = self._encrypt_record(updated)
+        self._db.update_record_raw(raw)
+        self._records[updated.id] = updated
+        return updated
+
+    def _build_updated_record(self, existing: PasswordRecord, **fields: str | bool) -> PasswordRecord:
         cleaned = self._validate_fields(
             str(fields.get("title", existing.title)),
             str(fields.get("username", existing.username)),
@@ -203,7 +236,7 @@ class PasswordService:
             str(fields.get("notes", existing.notes)),
             bool(fields.get("favorite", existing.favorite)),
         )
-        updated = PasswordRecord(
+        return PasswordRecord(
             id=existing.id,
             created_at=existing.created_at,
             updated_at=utc_now(),
@@ -211,10 +244,6 @@ class PasswordService:
             key_version=self._keys.key_version,
             **cleaned,
         )
-        raw = self._encrypt_record(updated)
-        self._db.update_record_raw(raw)
-        self._records[updated.id] = updated
-        return updated
 
     def delete_record(self, record_id: str) -> None:
         self._require_loaded()
@@ -254,7 +283,7 @@ class PasswordService:
         category_id: str,
         notes: str,
         favorite: bool,
-    ) -> dict[str, object]:
+    ) -> _ValidatedFields:
         title = (title or "").strip()
         username = (username or "").strip()
         password = password or ""
@@ -276,7 +305,7 @@ class PasswordService:
             raise ValidationError("Ссылка слишком длинная.")
         if len(notes) > config.MAX_NOTES_LENGTH:
             raise ValidationError("Заметка слишком длинная.")
-        if not self.settings.category(category_id):
+        if self._settings is None or not self._settings.category(category_id):
             raise ValidationError("Выбранная категория не существует.")
 
         url = self._normalize_url(url)
@@ -309,6 +338,13 @@ class PasswordService:
     # ------------------------------------------------------------------ categories
     def save_settings(self, settings: AppSettings) -> None:
         self._require_loaded()
+        self._validate_settings(settings)
+        snapshot = copy.deepcopy(settings)
+        self._store_settings(snapshot)
+        self._settings = snapshot
+
+    @staticmethod
+    def _validate_settings(settings: AppSettings) -> None:
         allowed_auto_lock = {value for value, _ in config.AUTO_LOCK_OPTIONS}
         allowed_clipboard = {value for value, _ in config.CLIPBOARD_OPTIONS}
         if settings.auto_lock_minutes not in allowed_auto_lock:
@@ -317,30 +353,43 @@ class PasswordService:
             raise ValidationError("Некорректное значение автоочистки буфера.")
         if not settings.categories:
             raise ValidationError("Должна быть хотя бы одна категория.")
-        self._store_settings(settings)
-        self._settings = settings
+        if not any(category.id == "other" for category in settings.categories):
+            raise ValidationError("Категория «Другое» должна существовать.")
 
-    def _store_settings(self, settings: AppSettings) -> None:
+    def _store_settings(
+        self,
+        settings: AppSettings,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         payload = json.dumps(settings.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         nonce, ciphertext = encryption.encrypt_bytes(
             self._keys.key, payload, self._settings_aad()
         )
-        self._db.set_settings_raw(nonce, ciphertext, format_timestamp(utc_now()))
+        self._db.set_settings_raw(
+            nonce,
+            ciphertext,
+            format_timestamp(utc_now()),
+            connection=connection,
+        )
 
     def add_category(self, name: str) -> Category:
         name = self._validate_category_name(name)
-        settings = self.settings
+        settings = copy.deepcopy(self._settings)
+        if settings is None:
+            raise VaultLockedError("Хранилище заблокировано.")
         if any(item.name.casefold() == name.casefold() for item in settings.categories):
             raise ValidationError("Категория с таким названием уже существует.")
         order = max((item.order for item in settings.categories), default=0) + 1
         category = Category(id=str(uuid.uuid4()), name=name, builtin=False, order=order)
         settings.categories.append(category)
         self.save_settings(settings)
-        return category
+        return self.settings.category(category.id) or category
 
     def rename_category(self, category_id: str, name: str) -> None:
         name = self._validate_category_name(name)
-        settings = self.settings
+        settings = copy.deepcopy(self._settings)
+        if settings is None:
+            raise VaultLockedError("Хранилище заблокировано.")
         category = settings.category(category_id)
         if category is None:
             raise ValidationError("Категория не найдена.")
@@ -355,14 +404,32 @@ class PasswordService:
     def delete_category(self, category_id: str) -> None:
         if category_id == "other":
             raise ValidationError("Категорию «Другое» удалить нельзя.")
-        settings = self.settings
+        settings = copy.deepcopy(self._settings)
+        if settings is None:
+            raise VaultLockedError("Хранилище заблокировано.")
         if settings.category(category_id) is None:
             raise ValidationError("Категория не найдена.")
-        for record in list(self._records.values()):
-            if record.category_id == category_id:
-                self.update_record(record.id, category_id="other")
+
+        updated_records: list[PasswordRecord] = []
+        raw_records: list[RawRecord] = []
+        for record in self._records.values():
+            if record.category_id != category_id:
+                continue
+            updated = self._build_updated_record(record, category_id="other")
+            updated_records.append(updated)
+            raw_records.append(self._encrypt_record(updated))
+
         settings.categories = [item for item in settings.categories if item.id != category_id]
-        self.save_settings(settings)
+        self._validate_settings(settings)
+
+        with self._db.transaction() as connection:
+            for raw in raw_records:
+                self._db.update_record_raw(raw, connection)
+            self._store_settings(settings, connection)
+
+        for updated in updated_records:
+            self._records[updated.id] = updated
+        self._settings = settings
 
     @staticmethod
     def _validate_category_name(name: str) -> str:
